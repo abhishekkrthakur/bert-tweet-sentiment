@@ -13,7 +13,7 @@ def loss_fn(start_logits, end_logits, start_positions, end_positions):
     loss_fct = nn.CrossEntropyLoss()
     start_loss = loss_fct(start_logits, start_positions)
     end_loss = loss_fct(end_logits, end_positions)
-    total_loss = (start_loss + end_loss) / 2
+    total_loss = (start_loss + end_loss)
     return total_loss
 
 
@@ -21,6 +21,7 @@ def train_fn(data_loader, model, optimizer, device, scheduler=None):
     model.train()
     model.zero_grad()
     losses = utils.AverageMeter()
+    jaccards = utils.AverageMeter()
 
     tk0 = tqdm(data_loader, total=len(data_loader))
     
@@ -32,6 +33,12 @@ def train_fn(data_loader, model, optimizer, device, scheduler=None):
         targets_start = d["targets_start"]
         targets_end = d["targets_end"]
         sentiment = d["sentiment"]
+        orig_selected = d["orig_selected"]
+        orig_tweet = d["orig_tweet"]
+        targets_start = d["targets_start"]
+        targets_end = d["targets_end"]
+        offsets_start = d["offsets_start"].numpy()
+        offsets_end = d["offsets_end"].numpy()
 
         ids = ids.to(device, dtype=torch.long)
         token_type_ids = token_type_ids.to(device, dtype=torch.long)
@@ -48,26 +55,37 @@ def train_fn(data_loader, model, optimizer, device, scheduler=None):
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 1.0)
-
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
         model.zero_grad()
 
-        losses.update(loss.item(), ids.size(0))
-        tk0.set_postfix(loss=losses.avg)
+        outputs_start = torch.softmax(outputs_start, dim=1).cpu().detach().numpy()
+        outputs_end = torch.softmax(outputs_end, dim=1).cpu().detach().numpy()
+        jaccard_scores = []
+        for px, tweet in enumerate(orig_tweet):
+            selected_tweet = orig_selected[px]
+            tweet_sentiment = sentiment[px]
+            jaccard_score = calculate_jaccard_score(
+                original_tweet=tweet,
+                target_string=selected_tweet,
+                sentiment_val=tweet_sentiment,
+                idx_start=np.argmax(outputs_start[px, :]),
+                idx_end=np.argmax(outputs_end[px, :]),
+                offsets_start=offsets_start[px, :],
+                offsets_end=offsets_end[px, :]
+            )
+            jaccard_scores.append(jaccard_score)
 
-def generate_eval_preds(data_loader, model, device):
+        jaccards.update(np.mean(jaccard_scores), ids.size(0))
+        losses.update(loss.item(), ids.size(0))
+        tk0.set_postfix(loss=losses.avg, jaccard=jaccards.avg)
+
+
+def eval_fn(data_loader, model, device):
     model.eval()
     losses = utils.AverageMeter()
-    fin_outputs_start = []
-    fin_outputs_end = []
-    fin_orig_selected = []
-    fin_orig_sentiment = []
-    fin_orig_tweet = []
-    fin_offsets_start = []
-    fin_offsets_end = []
+    jaccards = utils.AverageMeter()
     
     with torch.no_grad():
         tk0 = tqdm(data_loader, total=len(data_loader))
@@ -80,8 +98,8 @@ def generate_eval_preds(data_loader, model, device):
             orig_tweet = d["orig_tweet"]
             targets_start = d["targets_start"]
             targets_end = d["targets_end"]
-            offsets_start = d["offsets_start"]
-            offsets_end = d["offsets_end"]
+            offsets_start = d["offsets_start"].numpy()
+            offsets_end = d["offsets_end"].numpy()
 
             ids = ids.to(device, dtype=torch.long)
             token_type_ids = token_type_ids.to(device, dtype=torch.long)
@@ -95,66 +113,76 @@ def generate_eval_preds(data_loader, model, device):
                 token_type_ids=token_type_ids
             )
             loss = loss_fn(outputs_start, outputs_end, targets_start, targets_end)
-            
+            outputs_start = torch.softmax(outputs_start, dim=1).cpu().detach().numpy()
+            outputs_end = torch.softmax(outputs_end, dim=1).cpu().detach().numpy()
+            jaccard_scores = []
+            for px, tweet in enumerate(orig_tweet):
+                selected_tweet = orig_selected[px]
+                tweet_sentiment = sentiment[px]
+                jaccard_score = calculate_jaccard_score(
+                    original_tweet=tweet,
+                    target_string=selected_tweet,
+                    sentiment_val=tweet_sentiment,
+                    idx_start=np.argmax(outputs_start[px, :]),
+                    idx_end=np.argmax(outputs_end[px, :]),
+                    offsets_start=offsets_start[px, :],
+                    offsets_end=offsets_end[px, :]
+                )
+                jaccard_scores.append(jaccard_score)
+
+            jaccards.update(np.mean(jaccard_scores), ids.size(0))
             losses.update(loss.item(), ids.size(0))
-            tk0.set_postfix(loss=losses.avg)
-            
-            fin_outputs_start.append(torch.softmax(outputs_start, dim=1).cpu().detach().numpy())
-            fin_outputs_end.append(torch.softmax(outputs_end, dim=1).cpu().detach().numpy())
-            fin_offsets_start.append(offsets_start.numpy())
-            fin_offsets_end.append(offsets_end.numpy())
+            tk0.set_postfix(loss=losses.avg, jaccard=jaccards.avg)
+    
+    print(f"Jaccard = {jaccards.avg}")
+    return jaccards.avg
 
-            fin_orig_sentiment.extend(sentiment)
-            fin_orig_selected.extend(orig_selected)
-            fin_orig_tweet.extend(orig_tweet)
+def calculate_jaccard_score(
+    original_tweet, 
+    target_string, 
+    sentiment_val, 
+    idx_start, 
+    idx_end, 
+    offsets_start, 
+    offsets_end,
+    verbose=False):
 
-    fin_outputs_start = np.vstack(fin_outputs_start)
-    fin_outputs_end = np.vstack(fin_outputs_end)
-    fin_offsets_start = np.vstack(fin_offsets_start)
-    fin_offsets_end = np.vstack(fin_offsets_end)
+    offsets = list(zip(offsets_start, offsets_end))
+    
+    if idx_end < idx_start:
+        idx_end = idx_start
+    
+    filtered_output  = ""
+    original_tweet_sp = " ".join(original_tweet.split())
+    for ix in range(idx_start, idx_end + 1):
+        if offsets[ix][0] == 0 and offsets[ix][1] == 0:
+            continue
+        filtered_output += original_tweet_sp[offsets[ix][0]: offsets[ix][1]]
+        if (ix+1) < len(offsets) and offsets[ix][1] < offsets[ix+1][0]:
+            filtered_output += " "
 
-    return (fin_outputs_start, fin_outputs_end, fin_orig_selected, fin_orig_sentiment,
-            fin_orig_tweet, fin_offsets_start, fin_offsets_end)
+    filtered_output = filtered_output.replace(" .", ".")
+    filtered_output = filtered_output.replace(" ?", "?")
+    filtered_output = filtered_output.replace(" !", "!")
+    filtered_output = filtered_output.replace(" ,", ",")
+    filtered_output = filtered_output.replace(" ' ", "'")
+    filtered_output = filtered_output.replace(" n't", "n't")
+    filtered_output = filtered_output.replace(" 'm", "'m")
+    filtered_output = filtered_output.replace(" do not", " don't")
+    filtered_output = filtered_output.replace(" 's", "'s")
+    filtered_output = filtered_output.replace(" 've", "'ve")
+    filtered_output = filtered_output.replace(" 're", "'re")
 
+    if sentiment_val == "neutral":
+        filtered_output = original_tweet
 
-def eval_fn(data_loader, model, device):
-    (fin_outputs_start, 
-    fin_outputs_end, 
-    fin_orig_selected, 
-    fin_orig_sentiment, 
-    fin_orig_tweet, 
-    fin_offsets_start,
-    fin_offsets_end) = generate_eval_preds(data_loader, model, device)
-    jaccards = []
+    if sentiment_val != "neutral" and verbose == True:
+        if filtered_output.strip().lower() != target_string.strip().lower():
+            print("********************************")
+            print(f"Output= {filtered_output.strip()}")
+            print(f"Target= {target_string.strip()}")
+            print(f"Tweet= {original_tweet.strip()}")
+            print("********************************")
 
-    for j in range(fin_outputs_start.shape[0]):
-        target_string = fin_orig_selected[j]
-        sentiment_val = fin_orig_sentiment[j]
-        original_tweet = fin_orig_tweet[j]
-        offsets_start = fin_offsets_start[j, :].tolist()
-        offsets_end = fin_offsets_end[j, :].tolist()
-        offsets = list(zip(offsets_start, offsets_end))
-
-        idx_start = np.argmax(fin_outputs_start[j, :])
-        idx_end = np.argmax(fin_outputs_end[j, :])
-        
-        if idx_end < idx_start:
-            idx_end = idx_start
-        
-        filtered_output  = ""
-        original_tweet = " ".join(original_tweet.split())
-        for ix in range(idx_start, idx_end + 1):
-            if offsets[ix][0] == 0 and offsets[ix][1] == 0:
-                continue
-            filtered_output += original_tweet[offsets[ix][0]: offsets[ix][1]]
-            if (ix+1) < len(offsets) and offsets[ix][1] < offsets[ix+1][0]:
-                filtered_output += " "
-
-        if sentiment_val == "neutral":
-            filtered_output = original_tweet
-
-        jac = utils.jaccard(target_string.strip(), filtered_output.strip())
-        jaccards.append(jac)
-
-    mean_jaccard = np.mean(jaccards)
-    return mean_jaccard
+    jac = utils.jaccard(target_string.strip(), filtered_output.strip())
+    return jac

@@ -1,5 +1,6 @@
 import config
 import dataset
+import os
 import engine
 import torch
 import utils
@@ -20,20 +21,13 @@ from transformers import get_linear_schedule_with_warmup
 from apex import amp
 
 
-def run():
+def run(fold):
     dfx = pd.read_csv(config.TRAINING_FILE)
-    dfx = dfx.dropna().reset_index(drop=True)
 
-    df_train, df_valid = model_selection.train_test_split(
-        dfx,
-        test_size=0.20,
-        random_state=42,
-        stratify=dfx.sentiment.values
-    )
-
-    df_train = df_train.reset_index(drop=True)
-    df_valid = df_valid.reset_index(drop=True)
-
+    df_train = dfx[dfx.kfold != fold].reset_index(drop=True)
+    df_valid = dfx[dfx.kfold == fold].reset_index(drop=True)
+    print(df_train.shape)
+    print(df_valid.shape)
     train_dataset = dataset.TweetDataset(
         tweet=df_train.text.values,
         sentiment=df_train.sentiment.values,
@@ -55,7 +49,7 @@ def run():
     valid_data_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=config.VALID_BATCH_SIZE,
-        num_workers=0
+        num_workers=2
     )
 
     device = torch.device("cuda")
@@ -65,12 +59,11 @@ def run():
     model.to(device)
 
     num_train_steps = int(len(df_train) / config.TRAIN_BATCH_SIZE * config.EPOCHS)
-    
+
     optimizer = AdamW(params.optimizer_params(model), lr=5e-5)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_train_steps)
 
     model, optimizer = amp.initialize(model, optimizer, opt_level="O1", verbosity=0)
-    model = nn.DataParallel(model)
 
     es = utils.EarlyStopping(patience=5, mode="max")
     sandesh.send("Training is Starting")
@@ -79,11 +72,12 @@ def run():
         jaccard = engine.eval_fn(valid_data_loader, model, device)
         print(f"Jaccard Score = {jaccard}")
         sandesh.send(f"Epoch={epoch}, Jaccard={jaccard}")
-        es(jaccard, model, model_path="model.bin")
+        es(jaccard, model, model_path=f"model_{fold}.bin")
         if es.early_stop:
             print("Early stopping")
             break
 
 
 if __name__ == "__main__":
-    run()
+    FOLD = int(os.environ.get("FOLD"))
+    run(fold=FOLD)
